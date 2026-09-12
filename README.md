@@ -18,7 +18,7 @@ The dashboard provides an interactive view of historical crude oil prices, machi
 
 ### Prediction Chart
 
-![Prediction Chart](screenshots/Predicition_chart.png)
+![Prediction Chart](screenshots/Prediction_chart.png)
 
 ### Geopolitical Risk Analysis
 
