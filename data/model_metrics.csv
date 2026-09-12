@@ -1,0 +1,6 @@
+Model,RMSE,MAE,R2,MAPE
+Linear Regression,0.54,0.48,0.9979,0.7
+Random Forest,6.18,5.0,0.7271,6.73
+XGBoost,5.73,4.67,0.7654,6.36
+Prophet,41.22,30.32,-11.1612,39.08
+ARIMA,14.46,13.08,-0.4958,19.17
