@@ -4,6 +4,28 @@
 
 ---
 
+## Dashboard Preview
+
+![Dashboard Overview](screenshots/dashboard.png)
+
+The dashboard provides an interactive view of historical crude oil prices, machine learning forecasts, geopolitical risk signals, inflation indicators, OPEC production trends, and model performance metrics.
+
+## Key Dashboard Screens
+
+### Live Oil Price Monitor
+
+![Live Monitor](screenshots/Live_Monitor.png)
+
+### Prediction Chart
+
+![Prediction Chart](screenshots/Predicition_chart.png)
+
+### Geopolitical Risk Analysis
+
+![Geopolitical Risk Analysis](screenshots/Geopolitical_risks.png)
+
+---
+
 ## 📋 Table of Contents
 
 1. [Overview](#overview)
