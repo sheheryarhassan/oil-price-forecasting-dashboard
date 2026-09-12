@@ -3,7 +3,9 @@
 > A complete, portfolio-ready oil price forecasting dashboard built with Python, Streamlit, and machine learning.
 
 ---
+## Live Demo
 
+[Open the live Streamlit app]([https://YOUR-APP-NAME.streamlit.ap](https://oil-price-forecasting-dashboard-bvuagyxpusr8wjanm5fulj.streamlit.app)
 ## Dashboard Preview
 
 ![Dashboard Overview](screenshots/dashboard.png)
