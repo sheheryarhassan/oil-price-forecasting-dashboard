@@ -15,7 +15,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 warnings.filterwarnings("ignore")
 
-from config import START_DATE, END_DATE, DATA_DIR
+from config import DATA_DIR
 
 
 def load_all_csvs() -> dict:
@@ -46,7 +46,7 @@ def merge_all_data(data: dict) -> pd.DataFrame:
     This aligns different sources (daily, weekly, monthly).
     """
     # Common monthly date range
-    date_range = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
+    date_range = data["market"]["WTI"].dropna().index
     master = pd.DataFrame(index=date_range)
 
     for key, df in data.items():
@@ -211,7 +211,7 @@ def clean_and_merge_data(data: dict = None,
     df = handle_missing_values(df)
 
     # Remove extreme outliers
-    df = remove_outliers(df)
+    # Keep observed futures prices, including genuine market shocks.
 
     # Add derived features
     df = add_derived_features(df)

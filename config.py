@@ -19,25 +19,8 @@
 FRED_API_KEY = None   # Optional — not required for CPI/FedFundsRate anymore
 EIA_API_KEY  = None   # Optional — only used for a future OPEC-data upgrade
 
-# --- Date Range for Historical Data ---
-# END_DATE is computed as "today" every run so the historical dataset never
-# goes stale. The previous hardcoded "2025-12-31" meant the model was
-# always missing the most recent months of real price action — a real
-# source of forecast inaccuracy, since the forecast's own starting point
-# was out of date.
-import datetime as _dt
-
+# History begins here. Forecast dates follow the last observed market month.
 START_DATE = "2015-01-01"
-END_DATE   = _dt.date.today().strftime("%Y-%m-%d")
-
-# --- Forecast Horizon ---
-# Starts the month AFTER the last available historical month, and always
-# covers 3 full years forward from today.
-_today = _dt.date.today()
-_forecast_start_year = _today.year if _today.month < 12 else _today.year + 1
-_forecast_start_month = _today.month + 1 if _today.month < 12 else 1
-FORECAST_START = f"{_forecast_start_year}-{_forecast_start_month:02d}-01"
-FORECAST_END   = f"{_today.year + 3}-12-31"
 
 # --- File Paths ---
 DATA_DIR = "data"

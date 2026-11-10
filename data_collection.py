@@ -25,26 +25,23 @@
 #        and should not be read as one - it's a second view on the same
 #        real geopolitical signal, not a new one.
 #
-# Every "real" fetch function below falls back to a clearly-labeled
-# synthetic series (same as the previous version of this module) if the
-# live source is unreachable or its format changes, so the pipeline never
-# hard-crashes on a network hiccup. Every fallback path prints a warning
-# so it's never silently mistaken for real data.
+# A source outage keeps saved observations and reports their age in the app.
 # ============================================================
 
 import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 import warnings
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 from io import BytesIO
-from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
 from config import (
-    FRED_API_KEY, EIA_API_KEY, START_DATE, END_DATE, DATA_DIR, KEY_EVENTS
+    START_DATE, DATA_DIR
 )
 
 REQUEST_TIMEOUT = 30  # seconds, for all external HTTP calls below
@@ -52,13 +49,6 @@ REQUEST_TIMEOUT = 30  # seconds, for all external HTTP calls below
 # Sent on every external request below. Some government/data sites are
 # known to reject requests carrying Python's default User-Agent as basic
 # anti-bot protection, so a standard browser-like one is used defensively.
-# (Note: this sandbox's own network egress is restricted to an allowlist
-# that doesn't include fred.stlouisfed.org, eia.gov, or matteoiacoviello.com,
-# so these three fetch functions could not be tested against the live
-# internet from here — only against realistic mocked responses, see the
-# project delivery notes. Verify these three real fetches actually
-# succeed the first time you run this locally, where you'll have normal
-# internet access.)
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -79,7 +69,7 @@ def _ensure_data_dir():
 # 1. Market Data via Yahoo Finance (FREE, no API key) — REAL
 # ------------------------------------------------------------------
 
-def fetch_market_data() -> pd.DataFrame:
+def fetch_daily_market() -> pd.DataFrame:
     """
     Download daily price data for oil-related financial instruments.
 
@@ -112,11 +102,11 @@ def fetch_market_data() -> pd.DataFrame:
     for name, symbol in tickers.items():
         try:
             raw = yf.download(
-                symbol, start=START_DATE, end=END_DATE,
-                progress=False, auto_adjust=False, threads=False,
+                symbol, start=START_DATE, end=pd.Timestamp.now(tz="America/New_York").date().isoformat(),
+                progress=False, auto_adjust=False, threads=False, timeout=10,
             )
             if raw is None or len(raw) <= 100:
-                print(f"    -- {name:15s} ({symbol}): too little data - will synthesize")
+                print(f"    -- {name:15s} ({symbol}): too little data")
                 continue
 
             # Handle both flat and MultiIndex column layouts.
@@ -125,7 +115,7 @@ def fetch_market_data() -> pd.DataFrame:
                     close = raw["Close"]
                     series = close.iloc[:, 0] if hasattr(close, "columns") else close
                 else:
-                    print(f"    -- {name:15s} ({symbol}): unexpected column layout - will synthesize")
+                    print(f"    -- {name:15s} ({symbol}): unexpected column layout")
                     continue
             else:
                 series = raw["Close"]
@@ -133,193 +123,109 @@ def fetch_market_data() -> pd.DataFrame:
             frames[name] = series.squeeze()
             print(f"    OK {name:15s} ({symbol}): {len(raw):,} rows")
         except Exception as exc:
-            print(f"    -- {name:15s} ({symbol}): {exc} - will synthesize")
+            print(f"    -- {name:15s} ({symbol}): {exc}")
 
-    df = pd.DataFrame(frames)
-    df.index = pd.to_datetime(df.index)
-
-    df_monthly = df.resample("MS").mean()
-    df_monthly = _fill_synthetic_prices(df_monthly)
-
-    return df_monthly
-
-
-def _fill_synthetic_prices(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If Yahoo Finance returns incomplete columns, fill them with
-    realistic SYNTHETIC time series so the rest of the pipeline works.
-    This path should rarely trigger since CL=F/BZ=F are liquid, actively
-    quoted futures with a long Yahoo Finance history.
-    """
-    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
-    n = len(dates)
-    ref = pd.DataFrame(index=dates)
-
-    if "WTI" not in df.columns or df["WTI"].isna().mean() > 0.4:
-        print("    [FALLBACK] synthesizing WTI prices - real Yahoo Finance data unavailable")
-        wti = _synthetic_wti(dates)
-        ref["WTI"] = wti
-
-    if "Brent" not in df.columns or df["Brent"].isna().mean() > 0.4:
-        print("    [FALLBACK] synthesizing Brent prices - real Yahoo Finance data unavailable")
-        base = ref.get("WTI", df.get("WTI", pd.Series(65, index=dates)))
-        ref["Brent"] = base + np.random.normal(3, 0.5, n)
-
-    for col in ref.columns:
-        if col not in df.columns:
-            df[col] = ref[col]
-
-    df = df.reindex(dates)
-    df = df.ffill().bfill()
-    return df
+    daily = pd.DataFrame(frames).sort_index().replace([np.inf, -np.inf], np.nan)
+    daily.index = pd.to_datetime(daily.index).tz_localize(None)
+    for name in ("WTI", "Brent"):
+        if name not in daily or daily[name].count() < 100:
+            raise ValueError(f"No usable {name} futures history from Yahoo Finance")
+    return daily
 
 
-def _synthetic_wti(dates) -> np.ndarray:
-    """FALLBACK ONLY. Approximate historical WTI shape, used only if
-    Yahoo Finance is completely unreachable for CL=F."""
-    n = len(dates)
-    prices = np.zeros(n)
-    for i, d in enumerate(dates):
-        y, m = d.year, d.month
-        if y <= 2015:
-            base = 55 - (m - 1) * 0.5
-        elif y == 2016:
-            base = 40 + (m - 1) * 1.5
-        elif y == 2017:
-            base = 50 + (m - 1) * 0.5
-        elif y == 2018:
-            base = 55 + (m - 1) * 1.5
-        elif y == 2019:
-            base = 65 - (m - 1) * 0.2
-        elif y == 2020:
-            if m <= 3:
-                base = 55 - (m - 1) * 10
-            elif m == 4:
-                base = 15
-            elif m <= 8:
-                base = 15 + (m - 4) * 8
-            else:
-                base = 40 + (m - 8) * 1.5
-        elif y == 2021:
-            base = 50 + (m - 1) * 3
-        elif y == 2022:
-            if m <= 3:
-                base = 80 + (m - 1) * 10
-            elif m <= 6:
-                base = 100 + (m - 3) * 5
-            else:
-                base = 110 - (m - 6) * 5
-        elif y == 2023:
-            base = 80 - (m - 1) * 0.5
-        else:
-            base = 72 + np.sin(m * 0.3) * 4
-        prices[i] = base + np.random.normal(0, 2)
-    return np.clip(prices, 10, 150)
+def save_frame(frame, path):
+    # Replace only after the complete CSV has been written.
+    with NamedTemporaryFile(mode="w", dir=Path(path).parent, delete=False) as tmp:
+        try:
+            frame.to_csv(tmp)
+            tmp.close()
+            os.replace(tmp.name, path)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+
+
+def fetch_market_data():
+    return fetch_daily_market().resample("MS").mean().dropna(subset=["WTI"])
+
+
+def load_market(force_refresh):
+    daily_path = Path(DATA_DIR, "market_daily.csv")
+    monthly_path = Path(DATA_DIR, "market_data.csv")
+    daily = None
+    warnings_list = []
+    if daily_path.exists():
+        daily = pd.read_csv(daily_path, index_col=0, parse_dates=True)
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    checked_today = daily_path.exists() and (
+        pd.Timestamp(daily_path.stat().st_mtime, unit="s", tz="UTC")
+        .tz_convert("America/New_York").date() == today
+    )
+    cache_recent = daily is not None and all(
+        name in daily and daily[name].notna().any()
+        and daily[name].last_valid_index() >= pd.Timestamp(today) - pd.offsets.BDay(1)
+        for name in ("WTI", "Brent")
+    )
+    if force_refresh or not (checked_today and cache_recent):
+        try:
+            fresh = fetch_daily_market()
+            for name in ("WTI", "Brent"):
+                last = fresh[name].last_valid_index()
+                if (pd.Timestamp(today) - last).days > 7:
+                    raise ValueError(f"{name} download ends on {last.date()}")
+                if daily is not None and last < daily[name].last_valid_index():
+                    raise ValueError(f"{name} download is older than the saved close")
+            updated = fresh if daily is None else fresh.combine_first(daily).sort_index()
+            months = updated["WTI"].resample("MS").count()
+            if len(months) < 36 or (months == 0).any():
+                raise ValueError("WTI history has missing months or fewer than three years of observations")
+            save_frame(updated, daily_path)
+            daily = updated
+        except Exception as exc:
+            warnings_list.append(f"Market refresh failed: {exc}. Showing saved history.")
+    if daily is None:
+        if not monthly_path.exists():
+            raise RuntimeError("No saved oil prices are available. " + " ".join(warnings_list))
+        monthly = pd.read_csv(monthly_path, index_col=0, parse_dates=True)
+        warnings_list.append("Using the bundled monthly snapshot. Daily closes are unavailable.")
+        quotes = {}
+    else:
+        monthly = daily.resample("MS").mean().dropna(subset=["WTI"])
+        quotes = {}
+        for name in ("WTI", "Brent"):
+            series = daily[name].dropna()
+            quotes[name] = (series.index[-1], series.iloc[-1])
+            if (pd.Timestamp(today) - series.index[-1]).days > 7:
+                warnings_list.append(f"Last saved {name} close is over a week old.")
+        save_frame(monthly, monthly_path)
+    monthly.attrs.update(quotes=quotes, warnings=warnings_list)
+    return monthly
 
 
 # ------------------------------------------------------------------
 # 2. Economic Data via FRED public CSV export (FREE, no API key) — REAL
 # ------------------------------------------------------------------
 
-def _fetch_fred_series_csv(series_id: str) -> pd.Series:
-    """
-    Fetch a single FRED series using FRED's public CSV export endpoint.
-    This endpoint requires NO API key and is the same underlying data
-    you'd get from an authenticated api.stlouisfed.org call.
-
-    Endpoint pattern:
-      https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL&cosd=1913-01-01&coed=9999-12-31
-    """
-    url = (
-        "https://fred.stlouisfed.org/graph/fredgraph.csv"
-        f"?id={series_id}&cosd=1913-01-01&coed=9999-12-31"
-    )
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
-    resp.raise_for_status()
-
-    df = pd.read_csv(BytesIO(resp.content))
-    # FRED's CSV header naming has changed over time ("DATE" vs
-    # "observation_date"); take columns positionally to be robust to that.
-    date_col, value_col = df.columns[0], df.columns[1]
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col)
-    series = pd.to_numeric(df[value_col], errors="coerce")
-    series.name = series_id
-    return series.dropna()
-
-
 def fetch_economic_data() -> pd.DataFrame:
-    """
-    Fetch macroeconomic indicators from FRED's public CSV export:
-      - CPI (Consumer Price Index, CPIAUCSL)  -> inflation proxy
-      - Federal Funds Rate (FEDFUNDS)         -> interest rate proxy
+    """Download both monthly indicators in one FRED request."""
+    names = {"CPIAUCSL": "CPI", "FEDFUNDS": "FedFundsRate"}
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    params = {"id": ",".join(names), "cosd": START_DATE,
+              "coed": pd.Timestamp.today().date().isoformat()}
+    for attempt in range(2):
+        try:
+            response = requests.get(url, params=params, headers=REQUEST_HEADERS, timeout=(5, 10))
+            response.raise_for_status()
+            break
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 1:
+                raise
 
-    No API key is needed for this endpoint, so this now runs by default
-    instead of only when FRED_API_KEY is set. Falls back to synthetic
-    data only if the request itself fails.
-    """
-    print("  Fetching economic data from FRED (public CSV export, no key needed) …")
-    try:
-        cpi = _fetch_fred_series_csv("CPIAUCSL")
-        fed = _fetch_fred_series_csv("FEDFUNDS")
-
-        df = pd.DataFrame({"CPI": cpi, "FedFundsRate": fed})
-        df = df.resample("MS").mean()
-        df = df.loc[(df.index >= START_DATE) & (df.index <= END_DATE)]
-
-        if df["CPI"].dropna().empty or df["FedFundsRate"].dropna().empty:
-            raise ValueError("FRED CSV export returned no usable rows")
-
-        print(f"    OK CPI: {df['CPI'].notna().sum()} rows, "
-              f"FedFundsRate: {df['FedFundsRate'].notna().sum()} rows")
-        return df
-
-    except Exception as exc:
-        print(f"    [FALLBACK] FRED fetch failed ({exc}) - synthesizing economic data")
-        return _synthetic_economic_data()
-
-
-def _synthetic_economic_data() -> pd.DataFrame:
-    """FALLBACK ONLY. Used only if the FRED CSV export is unreachable."""
-    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
-    n = len(dates)
-
-    cpi = np.linspace(237, 315, n)
-    for i, d in enumerate(dates):
-        y, m = d.year, d.month
-        if y == 2021:
-            cpi[i] += m * 1.5
-        elif y == 2022:
-            cpi[i] += max(0, 25 - m * 1.8)
-        elif y == 2023:
-            cpi[i] += max(0, 8 - m * 0.5)
-    cpi += np.random.normal(0, 0.5, n)
-
-    fed = np.zeros(n)
-    for i, d in enumerate(dates):
-        y, m = d.year, d.month
-        if y <= 2015:
-            fed[i] = 0.1 + (m - 1) * 0.02
-        elif y == 2016:
-            fed[i] = 0.4 + (m - 1) * 0.02
-        elif y == 2017:
-            fed[i] = 0.9 + (m - 1) * 0.1
-        elif y == 2018:
-            fed[i] = 1.5 + (m - 1) * 0.15
-        elif y == 2019:
-            fed[i] = max(1.5, 2.4 - (m - 1) * 0.08)
-        elif y == 2020:
-            fed[i] = max(0.1, 1.6 - m * 0.15)
-        elif y == 2021:
-            fed[i] = 0.1
-        elif y == 2022:
-            fed[i] = min(4.5, 0.1 + (m - 1) * 0.38)
-        elif y == 2023:
-            fed[i] = min(5.5, 4.5 + (m - 1) * 0.1)
-        elif y >= 2024:
-            fed[i] = max(4.25, 5.5 - (d.year - 2024) * 0.5 - (m - 1) * 0.03)
-
-    return pd.DataFrame({"CPI": cpi, "FedFundsRate": fed}, index=dates)
+    frame = pd.read_csv(BytesIO(response.content), index_col=0, parse_dates=True)
+    frame = frame[list(names)].rename(columns=names).apply(pd.to_numeric, errors="coerce")
+    frame = frame.resample("MS").mean().dropna(how="all")
+    if frame.count().min() == 0:
+        raise ValueError("FRED returned an empty economic indicator")
+    return frame
 
 
 # ------------------------------------------------------------------
@@ -380,7 +286,7 @@ def fetch_geopolitical_risk_index() -> pd.DataFrame:
         ).clip(0, 100)
 
         df = df.resample("MS").mean()
-        df = df.loc[(df.index >= START_DATE) & (df.index <= END_DATE)]
+        df = df.loc[(df.index >= START_DATE) & (df.index <= pd.Timestamp.today())]
 
         if df["GeopoliticalRiskIndex"].dropna().empty:
             raise ValueError("GPR fetch returned no rows in the configured date range")
@@ -389,45 +295,7 @@ def fetch_geopolitical_risk_index() -> pd.DataFrame:
         return df[["GeopoliticalRiskIndex"]]
 
     except Exception as exc:
-        print(f"    [FALLBACK] Real GPR index fetch failed ({exc}) - synthesizing risk index")
-        return _synthetic_geopolitical_risk_index()
-
-
-def _synthetic_geopolitical_risk_index() -> pd.DataFrame:
-    """FALLBACK ONLY. Hand-built approximation, used only if the real GPR
-    index at matteoiacoviello.com is unreachable."""
-    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
-    n = len(dates)
-    risk = np.full(n, 30.0)
-
-    for i, d in enumerate(dates):
-        y, m = d.year, d.month
-        if y == 2015:
-            risk[i] = 38 + 5 * np.sin(m)
-        elif y == 2016:
-            risk[i] = 36 + 4 * np.sin(m)
-        elif y == 2017:
-            risk[i] = 40 + 4 * np.sin(m * 2)
-        elif y == 2018:
-            risk[i] = 42 if m < 5 else 58 + 4 * np.sin(m)
-        elif y == 2019:
-            risk[i] = 78 if m in (9, 10) else 58
-        elif y == 2020:
-            risk[i] = 88 if m == 1 else (55 if m <= 3 else 32)
-        elif y == 2021:
-            risk[i] = 52 if m >= 8 else 44
-        elif y == 2022:
-            risk[i] = 50 if m == 1 else 82 + 5 * np.sin(m)
-        elif y == 2023:
-            risk[i] = 82 if m >= 10 else 70
-        elif y == 2024:
-            risk[i] = (84 + 3 * np.sin(m)) if m >= 4 else 76
-        else:
-            risk[i] = 78 + 4 * np.sin(m)
-        risk[i] += np.random.normal(0, 1.5)
-        risk[i] = float(np.clip(risk[i], 5, 100))
-
-    return pd.DataFrame({"GeopoliticalRiskIndex": risk}, index=dates)
+        raise ValueError(str(exc)) from exc
 
 
 # ------------------------------------------------------------------
@@ -454,8 +322,9 @@ def generate_opec_production() -> pd.DataFrame:
     fake integration would be worse than an honestly-labeled proxy.
     """
     print("  Generating OPEC+ production data [PROXY - see docstring for real-data upgrade path] …")
-    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
+    dates = pd.date_range(start=START_DATE, end=pd.Timestamp.today(), freq="MS")
     n = len(dates)
+    rng = np.random.default_rng(42)
     prod = np.zeros(n)
 
     for i, d in enumerate(dates):
@@ -491,7 +360,7 @@ def generate_opec_production() -> pd.DataFrame:
             # to this hand-built table.
             prod[i] = 30.8
 
-        prod[i] += np.random.normal(0, 0.2)
+        prod[i] += rng.normal(0, 0.2)
         prod[i] = float(np.clip(prod[i], 20, 40))
 
     return pd.DataFrame({"OPEC_Production_Mbpd": prod}, index=dates)
@@ -534,7 +403,7 @@ def fetch_crude_inventories() -> pd.DataFrame:
         df = df[["US_Crude_Inventory_Mbbl"]].dropna()
 
         df = df.resample("MS").mean()
-        df = df.loc[(df.index >= START_DATE) & (df.index <= END_DATE)]
+        df = df.loc[(df.index >= START_DATE) & (df.index <= pd.Timestamp.today())]
 
         if df["US_Crude_Inventory_Mbbl"].dropna().empty:
             raise ValueError("EIA inventory fetch returned no rows in the configured date range")
@@ -543,34 +412,7 @@ def fetch_crude_inventories() -> pd.DataFrame:
         return df
 
     except Exception as exc:
-        print(f"    [FALLBACK] Real EIA inventory fetch failed ({exc}) - synthesizing inventories")
-        return _synthetic_crude_inventories()
-
-
-def _synthetic_crude_inventories() -> pd.DataFrame:
-    """FALLBACK ONLY. Used only if the EIA export is unreachable."""
-    dates = pd.date_range(start=START_DATE, end=END_DATE, freq="MS")
-    n = len(dates)
-
-    seasonal = 25 * np.sin(2 * np.pi * np.arange(n) / 12 + np.pi / 2)
-    trend = np.zeros(n)
-    for i, d in enumerate(dates):
-        y = d.year
-        if y <= 2016:
-            trend[i] = 40
-        elif y <= 2019:
-            trend[i] = 10
-        elif y == 2020:
-            trend[i] = 80 if d.month >= 4 else 15
-        elif y <= 2022:
-            trend[i] = max(0, 60 - (y - 2020) * 25)
-        else:
-            trend[i] = -5
-
-    noise = np.random.normal(0, 6, n)
-    inventory = 430 + seasonal + trend + noise
-    inventory = np.clip(inventory, 300, 620)
-    return pd.DataFrame({"US_Crude_Inventory_Mbbl": inventory}, index=dates)
+        raise ValueError(str(exc)) from exc
 
 
 # ------------------------------------------------------------------
@@ -622,85 +464,44 @@ def collect_all_data(force_refresh: bool = False):
 
     _ensure_data_dir()
 
-    results = {}
-
-    # --- Market Data (REAL) ---
-    path = f"{DATA_DIR}/market_data.csv"
-    if force_refresh or not os.path.exists(path):
-        df = fetch_market_data()
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["market"] = df
-
-    # --- Economic Data (REAL, FRED public CSV export) ---
-    path = f"{DATA_DIR}/economic_data.csv"
-    if force_refresh or not os.path.exists(path):
-        df = fetch_economic_data()
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["economic"] = df
-
-    # --- Geopolitical Risk (REAL, Caldara & Iacoviello GPR index) ---
-    path = f"{DATA_DIR}/geopolitical_data.csv"
-    if force_refresh or not os.path.exists(path):
-        df = fetch_geopolitical_risk_index()
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["geo"] = df
-
-    # --- OPEC Production (PROXY - see docstring) ---
-    path = f"{DATA_DIR}/opec_data.csv"
-    if force_refresh or not os.path.exists(path):
-        df = generate_opec_production()
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["opec"] = df
-
-    # --- Inventories (REAL, EIA public export) ---
-    path = f"{DATA_DIR}/inventory_data.csv"
-    if force_refresh or not os.path.exists(path):
-        df = fetch_crude_inventories()
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["inventory"] = df
-
-    # --- Risk Sentiment Proxy (derived from real GPR + real WTI) ---
-    path = f"{DATA_DIR}/sentiment_data.csv"
-    if force_refresh or not os.path.exists(path):
-        wti_series = results["market"]["WTI"] if "WTI" in results["market"].columns else None
-        df = generate_risk_sentiment_proxy(results["geo"], wti_series)
-        df.to_csv(path)
-        print(f"  Saved -> {path}")
-    else:
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        print(f"  Loaded (cached) -> {path}")
-    results["sentiment"] = df
-
-    print("\n  Data collection complete!\n")
-    print("  Data authenticity summary:")
-    print("    REAL:   WTI/Brent/Gold/NatGas/USD/S&P500 (Yahoo Finance)")
-    print("    REAL:   CPI, Fed Funds Rate (FRED public export)")
-    print("    REAL:   US crude inventories (EIA public export)")
-    print("    REAL:   Geopolitical Risk Index (Caldara & Iacoviello / Fed)")
-    print("    PROXY:  OPEC+ production (hand-built from public policy history)")
-    print("    PROXY:  News sentiment (derived from real GPR + WTI volatility)")
-    print()
-
+    market = load_market(force_refresh)
+    results = {"market": market}
+    sources = [
+        ("economic", "economic_data", fetch_economic_data),
+        ("geo", "geopolitical_data", fetch_geopolitical_risk_index),
+        ("opec", "opec_data", generate_opec_production),
+        ("inventory", "inventory_data", fetch_crude_inventories),
+    ]
+    for key, filename, fetch in sources:
+        path = Path(DATA_DIR, filename + ".csv")
+        cached = pd.read_csv(path, index_col=0, parse_dates=True) if path.exists() else None
+        if key == "economic":
+            # Monthly indicators have different publication lags. Check once per day.
+            due = cached is None or pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").date() < pd.Timestamp.now(tz="UTC").date()
+        else:
+            due = cached is None or cached.index.max() < market.index.max()
+        if force_refresh or due:
+            try:
+                frame = fetch()
+                if frame.empty:
+                    raise ValueError("source returned no data")
+                if cached is not None:
+                    frame = frame.combine_first(cached)
+                save_frame(frame, path)
+            except Exception as exc:
+                if cached is None:
+                    raise
+                print(f"{key} refresh failed: {exc}")
+                if key == "economic":
+                    market.attrs["warnings"].append("FRED is unavailable. Showing saved CPI and Fed funds observations.")
+                else:
+                    market.attrs["warnings"].append(f"{key} refresh failed ({exc}). Using saved inputs.")
+                frame = cached
+        else:
+            frame = cached
+        results[key] = frame
+    results["sentiment"] = generate_risk_sentiment_proxy(results["geo"], market["WTI"])
+    save_frame(results["sentiment"], Path(DATA_DIR, "sentiment_data.csv"))
     return results
 
 

@@ -16,15 +16,14 @@ import streamlit as st
 warnings.filterwarnings("ignore")
 
 from config import (
-    DATA_DIR, KEY_EVENTS, SCENARIOS,
-    START_DATE, END_DATE, FORECAST_START, FORECAST_END
+    KEY_EVENTS, SCENARIOS, START_DATE
 )
 
 # ============================================================
 # Page Configuration (must be FIRST Streamlit call)
 # ============================================================
 st.set_page_config(
-    page_title = "Oil Price Prediction 2026-2028",
+    page_title = "Oil Price Prediction (36 months)",
     page_icon  = "🛢️",
     layout     = "wide",
     initial_sidebar_state = "expanded",
@@ -80,7 +79,7 @@ st.markdown("""
 # ============================================================
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_all_data():
+def load_all_data(refresh_token, market_day):
     """Load or generate all data. Cached for 1 hour."""
     from data_collection     import collect_all_data
     from data_cleaning       import clean_and_merge_data
@@ -89,18 +88,20 @@ def load_all_data():
     from forecasting         import generate_forecasts, summarize_forecast
 
     # Collect / load raw data
-    raw   = collect_all_data(force_refresh=False)
+    raw   = collect_all_data(force_refresh=bool(refresh_token))
     clean = clean_and_merge_data(raw)
     feat, feat_cols = engineer_features(clean)
 
     # Train models
     results = train_all_models(feat, feat_cols)
 
-    # Generate 2026-2028 forecasts
+    # Generate (36 months) forecasts
     forecasts = generate_forecasts(clean, feat_cols, results["models"])
     summary   = summarize_forecast(forecasts)
 
     return {
+        "market_status": raw["market"].attrs,
+        "economic": raw["economic"],
         "clean":     clean,
         "feat":      feat,
         "feat_cols": feat_cols,
@@ -165,7 +166,7 @@ st.markdown("""
         🛢️ US Oil Price Prediction System
     </h1>
     <p style="color:#8892b0; font-size:1.1rem;">
-        AI-Powered WTI & Brent Forecasting · 2026–2028 · Geopolitical Analysis
+        Monthly WTI Futures Forecasting · Geopolitical Analysis
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -181,10 +182,10 @@ with st.sidebar:
     st.markdown("### 📅 Historical Date Range")
     hist_start = st.date_input("From", value=pd.Timestamp("2019-01-01"),
                                 min_value=pd.Timestamp(START_DATE),
-                                max_value=pd.Timestamp(END_DATE))
-    hist_end   = st.date_input("To",   value=pd.Timestamp(END_DATE),
+                                max_value=pd.Timestamp.today())
+    hist_end   = st.date_input("To",   value=pd.Timestamp.today(),
                                 min_value=pd.Timestamp(START_DATE),
-                                max_value=pd.Timestamp(END_DATE))
+                                max_value=pd.Timestamp.today())
 
     st.markdown("---")
     st.markdown("### 🎭 Forecast Scenario")
@@ -192,20 +193,20 @@ with st.sidebar:
         "Select Scenario",
         options=list(SCENARIOS.keys()),
         index=1,
-        help="Choose the geopolitical/economic scenario for 2026-2028 forecast"
+        help="Choose the geopolitical/economic scenario for the monthly WTI forecast"
     )
 
     st.markdown("---")
     st.markdown("### 📊 Chart Options")
     show_events = st.checkbox("Show Key Events", value=True)
-    show_ci     = st.checkbox("Show Confidence Interval", value=True)
+    show_ci     = st.checkbox("Show Scenario Range", value=True)
     show_ma     = st.checkbox("Show Moving Averages", value=True)
 
     st.markdown("---")
     st.markdown("### 🔄 Data Refresh")
     if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+        from uuid import uuid4
+        st.session_state["refresh_token"] = uuid4().hex
 
     st.markdown("---")
     st.caption("Data: Yahoo Finance · FRED · EIA\nModels: LR · RF · XGBoost · Prophet · ARIMA")
@@ -217,7 +218,7 @@ with st.sidebar:
 
 with st.spinner("Loading data and training models — please wait ~30 seconds on first run …"):
     try:
-        data = load_all_data()
+        data = load_all_data(st.session_state.get("refresh_token", ""), pd.Timestamp.now(tz="America/New_York").date())
     except Exception as e:
         st.error(f"Error loading data: {e}")
         st.info("Try refreshing the page or clicking '🔄 Refresh Data' in the sidebar.")
@@ -242,24 +243,24 @@ hist_df   = clean[hist_mask]
 st.markdown("---")
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 
-with col1:
-    last_wti = clean["WTI"].iloc[-1]
-    prev_wti = clean["WTI"].iloc[-2]
-    delta    = last_wti - prev_wti
-    kpi_card("WTI Crude (Latest)",
-             f"${last_wti:.2f}",
-             f"{'▲' if delta >= 0 else '▼'} ${abs(delta):.2f} MoM",
-             delta >= 0)
-
-with col2:
-    last_brent = clean["Brent"].iloc[-1] if "Brent" in clean.columns else last_wti + 3
-    kpi_card("Brent Crude (Latest)",
-             f"${last_brent:.2f}",
-             f"Spread: ${last_brent - last_wti:.1f}")
+status = data["market_status"]
+for warning in status["warnings"]:
+    st.warning(warning)
+quotes = status["quotes"]
+st.caption(f"Forecast input: monthly average WTI futures closes through {clean.index[-1]:%B %Y}. "
+           "The latest month can be partial. Prices are USD per barrel.")
+for column, name, ticker in [(col1, "WTI", "CL=F"), (col2, "Brent", "BZ=F")]:
+    with column:
+        if name in quotes:
+            day, price = quotes[name]
+            kpi_card(f"{name} futures close", f"${price:.2f}", f"{ticker} · {day:%b %d, %Y}")
+        else:
+            kpi_card(f"{name} monthly average", f"${clean[name].iloc[-1]:.2f}",
+                     f"Snapshot · {clean.index[-1]:%b %Y}")
 
 with col3:
     fc_base = forecasts["Base"]["WTI_Ensemble"].mean()
-    kpi_card("2026-28 Base Forecast",
+    kpi_card("36-Month Base Forecast",
              f"${fc_base:.0f}/bbl",
              "Average WTI")
 
@@ -271,17 +272,19 @@ with col4:
              f"Level: {level}",
              geo_val < 60)
 
-with col5:
-    cpi_val = clean["CPI"].iloc[-1] if "CPI" in clean.columns else 320
-    kpi_card("US CPI (Inflation)",
-             f"{cpi_val:.1f}",
-             "Monthly Index")
-
-with col6:
-    rate_val = clean["FedFundsRate"].iloc[-1] if "FedFundsRate" in clean.columns else 5.0
-    kpi_card("Fed Funds Rate",
-             f"{rate_val:.2f}%",
-             "Interest Rate")
+for column, field, label, number_format in (
+    (col5, "CPI", "US CPI (Inflation)", ".1f"),
+    (col6, "FedFundsRate", "Fed Funds Rate", ".2f"),
+):
+    observations = data["economic"][field].dropna()
+    with column:
+        if observations.empty:
+            kpi_card(label, "Unavailable")
+        else:
+            value = format(observations.iloc[-1], number_format)
+            if field == "FedFundsRate":
+                value += "%"
+            kpi_card(label, value, f"Observation · {observations.index[-1]:%b %Y}")
 
 st.markdown("---")
 
@@ -305,14 +308,14 @@ tabs = st.tabs([
 
 
 # ============================================================
-# TAB 1: Live Oil Price Monitor
+# TAB 1: Monthly Oil Price Monitor
 # ============================================================
 
 with tabs[0]:
-    st.subheader("Live Oil Price Monitor")
+    st.subheader("Monthly Oil Price Monitor")
 
     # Price chart: last 12 months
-    last_12m = clean.last("12ME") if hasattr(clean, "last") else clean.tail(12)
+    last_12m = clean.tail(12)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -342,8 +345,8 @@ with tabs[0]:
     with col_b:
         st.markdown("#### WTI Price Statistics")
         stats = pd.DataFrame({
-            "Metric": ["Current", "3-Month Avg", "6-Month Avg",
-                       "12-Month Avg", "YTD High", "YTD Low",
+            "Metric": ["Latest Monthly Avg", "3-Month Avg", "6-Month Avg",
+                       "12-Month Avg", "12-Month High", "12-Month Low",
                        "52-Week Chg %"],
             "Value": [
                 f"${clean['WTI'].iloc[-1]:.2f}",
@@ -452,17 +455,19 @@ with tabs[1]:
 # ============================================================
 
 with tabs[2]:
-    st.subheader(f"2026–2028 Oil Price Forecast — {scenario_choice} Scenario")
+    st.subheader(f"Monthly WTI Forecast — {scenario_choice} Scenario")
 
     sc_info = SCENARIOS[scenario_choice]
     st.info(f"**{sc_info['label']}:** {sc_info['description']}")
 
+    st.caption(f"Base method: {results['models']['forecast_method']}. Selected by one-month holdout MAE. " 
+               "Scenario premiums are assumptions. Shading is an illustrative range.")
     fc_df = forecasts[scenario_choice]
 
     fig = go.Figure()
 
     # Historical tail (last 2 years)
-    hist_tail = clean.last("24ME") if hasattr(clean, "last") else clean.tail(24)
+    hist_tail = clean.tail(24)
     fig.add_trace(go.Scatter(
         x=hist_tail.index, y=hist_tail["WTI"],
         name="Historical WTI",
@@ -484,7 +489,7 @@ with tabs[2]:
             fill="toself",
             fillcolor=f"rgba(0,212,255,0.10)",
             line={"color": "rgba(0,0,0,0)"},
-            name="95% Confidence Interval",
+            name="Illustrative range",
             showlegend=True
         ))
 
@@ -503,12 +508,11 @@ with tabs[2]:
             ))
 
     # Add a divider at forecast start
-    fig.add_vline(x=pd.Timestamp(FORECAST_START),
-                  line_dash="dash", line_color="#ffd700",
-                  annotation_text="Forecast Start", annotation_font_color="#ffd700")
+    fig.add_vline(x=forecasts["Base"].index[0].isoformat(),
+                  line_dash="dash", line_color="#ffd700")
 
     fig.update_layout(
-        title="WTI Oil Price Forecast 2026–2028",
+        title="WTI Oil Price Forecast (36 months)",
         yaxis_title="Price (USD/barrel)",
         height=480, hovermode="x unified"
     )
@@ -524,7 +528,7 @@ with tabs[2]:
     fig_bar = go.Figure()
     fig_bar.add_trace(go.Bar(
         x=fc_q.index, y=fc_q["WTI_Ensemble"],
-        name="Ensemble Forecast",
+        name="Scenario Forecast",
         marker_color=sc_info["color"],
         error_y={"type": "data",
                  "array": (fc_q["WTI_Upper"] - fc_q["WTI_Ensemble"]).values,
@@ -729,7 +733,7 @@ with tabs[4]:
     with col2:
         st.warning("**Rate Hikes → Lower Oil**\nWhen the Fed raises rates, the USD strengthens and economic activity slows — both depress oil demand and prices.")
     with col3:
-        st.error("**Real Rate Matters Most**\nNegative real rates (Fed rate < inflation) are the most bullish environment for commodities including oil.")
+        st.info("**Real Rate Matters Most**\nNegative real rates (Fed rate < inflation) are the most bullish environment for commodities including oil.")
 
 
 # ============================================================
@@ -788,7 +792,7 @@ with tabs[5]:
             st.metric("Break-even Price", "~$70/bbl", "Saudi Arabia")
 
         # OPEC Production forecast
-        st.markdown("#### OPEC+ Production Forecast 2026-2028")
+        st.markdown("#### OPEC+ Production Forecast (36 months)")
         for sc_name, fc_df in forecasts.items():
             pass  # just use Base
         fc_df = forecasts["Base"]
@@ -804,7 +808,7 @@ with tabs[5]:
                 x=opec_fc.index, y=opec_fc,
                 name="Forecast", line={"color": "#7ecfc0", "dash": "dash"}
             ))
-            fig_opec_fc.add_vline(x=pd.Timestamp(FORECAST_START),
+            fig_opec_fc.add_vline(x=forecasts["Base"].index[0].isoformat(),
                                    line_dash="dash", line_color="#ffd700")
             fig_opec_fc.update_layout(title="OPEC+ Production Forecast",
                                        yaxis_title="Mbpd", height=320)
@@ -942,7 +946,7 @@ with tabs[7]:
     col_res1, col_res2, col_res3 = st.columns(3)
 
     with col_res1:
-        kpi_card("Current WTI Price", f"${base_price:.2f}")
+        kpi_card("Monthly WTI Average", f"${base_price:.2f}")
     with col_res2:
         direction = "▲" if total_impact >= 0 else "▼"
         kpi_card("Total Price Impact",
@@ -1024,12 +1028,10 @@ with tabs[8]:
                 showlegend=False
             ))
 
-    fig_comp.add_vline(x=pd.Timestamp(FORECAST_START),
-                        line_dash="dash", line_color="#ffd700",
-                        annotation_text="Forecast Start →",
-                        annotation_font_color="#ffd700")
+    fig_comp.add_vline(x=forecasts["Base"].index[0].isoformat(),
+                        line_dash="dash", line_color="#ffd700")
     fig_comp.update_layout(
-        title="WTI Oil Price: All Scenarios 2026–2028",
+        title="WTI Oil Price: All Scenarios (36 months)",
         yaxis_title="Price (USD/barrel)",
         height=480, hovermode="x unified"
     )
@@ -1039,14 +1041,17 @@ with tabs[8]:
     # Summary table
     st.markdown("#### Forecast Summary by Year & Scenario")
     pivot = summary.pivot(index="Year", columns="Scenario", values="Avg WTI ($)")
-    st.dataframe(pivot.style.format("${:.2f}").background_gradient(
-        cmap="RdYlGn", axis=None
-    ), use_container_width=True)
+    st.dataframe(
+        pivot,
+        column_config={col: st.column_config.NumberColumn(format="$%.2f") for col in pivot},
+        use_container_width=True,
+    )
 
     # Year by year comparison
-    col_a, col_b, col_c = st.columns(3)
-    for i, year in enumerate([2026, 2027, 2028]):
-        with [col_a, col_b, col_c][i]:
+    years = sorted(summary["Year"].unique())
+    year_columns = st.columns(len(years))
+    for year, column in zip(years, year_columns):
+        with column:
             st.markdown(f"#### {year} Forecast")
             yr_summary = summary[summary["Year"] == year].copy()
             yr_summary = yr_summary.set_index("Scenario")[
@@ -1055,16 +1060,11 @@ with tabs[8]:
             st.dataframe(yr_summary, use_container_width=True)
 
     # Download combined forecast
-    try:
-        combined_df = pd.read_csv(f"{DATA_DIR}/forecast_combined.csv",
-                                   index_col=0, parse_dates=True)
-        csv_combined = combined_df.to_csv().encode("utf-8")
-        st.download_button("⬇️ Download All Scenarios CSV",
-                            data=csv_combined,
-                            file_name="oil_price_forecast_2026_2028.csv",
-                            mime="text/csv")
-    except Exception:
-        pass
+    from forecasting import combine_forecasts
+    st.download_button("⬇️ Download All Scenarios CSV",
+                       data=combine_forecasts(forecasts).to_csv().encode("utf-8"),
+                       file_name="oil_price_forecast_36_months.csv",
+                       mime="text/csv")
 
 
 # ============================================================
@@ -1078,13 +1078,20 @@ with tabs[9]:
 
     # Metrics table with highlighting
     st.markdown("#### Model Comparison Table")
+    st.caption("Regression models and Last month use the prior observed month for each one-month test prediction. "
+               "Prophet and ARIMA forecast the entire holdout from its start. These scores measure different horizons.")
     st.markdown("_Lower RMSE/MAE = better accuracy. Higher R² = better fit._")
-    styled = metrics_df.style.format({
-        "RMSE": "${:.2f}", "MAE": "${:.2f}",
-        "R2": "{:.4f}", "MAPE": "{:.1f}%"
-    }).background_gradient(subset=["R2"], cmap="Greens") \
-      .background_gradient(subset=["RMSE"], cmap="Reds_r")
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(
+        metrics_df,
+        column_config={
+            "RMSE": st.column_config.NumberColumn(format="$%.2f"),
+            "MAE": st.column_config.NumberColumn(format="$%.2f"),
+            "R2": st.column_config.NumberColumn(format="%.4f"),
+            "MAPE": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
 
     # Metrics bar charts
     col_a, col_b = st.columns(2)
@@ -1130,6 +1137,7 @@ with tabs[9]:
     st.markdown("#### Actual vs Predicted Prices (Test Set)")
     best_model = metrics_df.loc[metrics_df["RMSE"].idxmin(), "Model"]
     model_key_map = {
+        "Last month": "Persistence",
         "Random Forest":    "RandomForest",
         "XGBoost":          "XGBoost",
         "Linear Regression":"LinearRegression",

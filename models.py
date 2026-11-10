@@ -187,8 +187,6 @@ def train_prophet(df_feat: pd.DataFrame, target: str = "WTI"):
         uncertainty_samples = 300
     )
 
-    # Add monthly seasonality
-    model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
 
     model.fit(prophet_df)
     return model
@@ -275,7 +273,8 @@ def train_all_models(df_feat: pd.DataFrame,
     print("=" * 60)
 
     # Split data
-    X_tr, X_te, y_tr, y_te, d_tr, d_te = split_data(df_feat,
+    completed = df_feat[df_feat.index < pd.Timestamp.today().to_period("M").start_time]
+    X_tr, X_te, y_tr, y_te, d_tr, d_te = split_data(completed,
                                                        feature_cols,
                                                        target)
     print(f"  Train: {len(X_tr)} samples ({d_tr[0].date()} → {d_tr[-1].date()})")
@@ -284,6 +283,10 @@ def train_all_models(df_feat: pd.DataFrame,
     models    = {}
     metrics   = []
     forecasts = {}   # test-set predictions for each model
+
+    previous_month = df_feat[target].shift(1).loc[d_te].to_numpy()
+    metrics.append(evaluate_model(y_te, previous_month, "Last month"))
+    forecasts["Persistence"] = (d_te, previous_month, y_te)
 
     # --- Linear Regression ---
     print("\n  [1/5] Training Linear Regression …")
@@ -326,7 +329,6 @@ def train_all_models(df_feat: pd.DataFrame,
             prophet_fc = prophet_model.predict(future_prophet)
             # Take only the last len(d_te) rows that correspond to test period
             prophet_pred = prophet_fc.tail(len(d_te))["yhat"].values
-            prophet_pred = np.clip(prophet_pred, 20, 200)
             models["Prophet"]    = prophet_model
             metrics.append(evaluate_model(y_te, prophet_pred, "Prophet"))
             forecasts["Prophet"] = (d_te, prophet_pred, y_te)
@@ -364,6 +366,21 @@ def train_all_models(df_feat: pd.DataFrame,
     metrics_df.to_csv(f"{DATA_DIR}/model_metrics.csv", index=False)
 
     print(f"\n  Results saved to {DATA_DIR}/\n")
+
+    # Choose the one-month method on the chronological holdout. The time
+    # series models above use a fixed origin and are shown separately.
+    names = {"Last month": "Persistence", "Linear Regression": "LinearRegression",
+             "Random Forest": "RandomForest", "XGBoost": "XGBoost"}
+    candidates = metrics_df[metrics_df["Model"].isin(names)]
+    chosen = names[candidates.loc[candidates["MAE"].idxmin(), "Model"]]
+    X_all, y_all = df_feat[feature_cols].values, df_feat[target].values
+    for key in ("LinearRegression", "RandomForest", "XGBoost"):
+        models[key].fit(X_all, y_all)
+    if "Prophet" in models:
+        models["Prophet"] = train_prophet(df_feat, target)
+    if "ARIMA" in models:
+        models["ARIMA"] = train_arima(df_feat[target])
+    models["forecast_method"] = chosen
 
     return {
         "models":      models,

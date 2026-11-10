@@ -58,8 +58,8 @@ def add_rolling_features(df: pd.DataFrame,
         windows = [3, 6, 12]  # 3-month, 6-month, 12-month windows
 
     for w in windows:
-        df[f"{target_col}_Roll_Mean_{w}M"] = df[target_col].rolling(w).mean()
-        df[f"{target_col}_Roll_Std_{w}M"]  = df[target_col].rolling(w).std()
+        df[f"{target_col}_Roll_Mean_{w}M"] = df[target_col].shift(1).rolling(w).mean()
+        df[f"{target_col}_Roll_Std_{w}M"]  = df[target_col].shift(1).rolling(w).std()
 
     # Price momentum: current vs 12-months-ago (year-on-year change)
     df[f"{target_col}_YoY_Change"] = (
@@ -231,20 +231,13 @@ def engineer_features(df: pd.DataFrame,
     print("  Adding OPEC surprise …")
     df_feat = add_opec_surprise(df_feat)
 
-    # Drop rows where lag features create NaN (first 12 rows)
-    df_feat.dropna(subset=[f"{target}_Lag12"], inplace=True)
-
-    # Define which columns to use as features (X)
-    # We exclude the raw target and purely descriptive columns
-    exclude_from_x = [target, "Brent", "WTI_Real",
-                      "Gasoline_ETF", "Year", "Quarter"]
-
-    feature_cols = [
-        c for c in df_feat.columns
-        if c not in exclude_from_x
-        and df_feat[c].dtype in [np.float64, np.float32, np.int64, np.int32]
-        and not df_feat[c].isna().any()
-    ]
+    # Every price predictor must be available before the target month starts.
+    # Keep descriptive, contemporaneous fields for the dashboard only.
+    feature_cols = [f"{target}_Lag{n}" for n in (1, 2, 3, 6, 12)]
+    for months in (3, 6, 12):
+        feature_cols.extend([f"{target}_Roll_Mean_{months}M", f"{target}_Roll_Std_{months}M"])
+    feature_cols.extend(["Month_Sin", "Month_Cos"])
+    df_feat = df_feat.dropna(subset=feature_cols + [target])
 
     print(f"  Total features created: {len(feature_cols)}")
     print(f"  Training samples:       {len(df_feat)}")
